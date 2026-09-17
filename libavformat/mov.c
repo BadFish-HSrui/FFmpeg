@@ -1904,6 +1904,7 @@ static int update_frag_index(MOVContext *c, int64_t offset)
 
         frag_stream_info[i].id = sc->id;
         frag_stream_info[i].sidx_pts = AV_NOPTS_VALUE;
+        frag_stream_info[i].sidx_duration = 0;
         frag_stream_info[i].tfdt_dts = AV_NOPTS_VALUE;
         frag_stream_info[i].next_trun_dts = AV_NOPTS_VALUE;
         frag_stream_info[i].first_tfra_pts = AV_NOPTS_VALUE;
@@ -6533,6 +6534,51 @@ static int mov_read_trun(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+static void mov_export_fragment_index(MOVContext *c)
+{
+    for (unsigned n = 0; n < c->fc->nb_streams; n++) {
+        AVStream *st = c->fc->streams[n];
+        MOVStreamContext *sc = st->priv_data;
+        if (!sc->has_sidx)
+            continue;
+        AVBPrint text;
+        av_bprint_init(&text, 256, 1024 * 1024);
+        av_bprintf(&text, "{\"ranges\":[");
+        int count = 0;
+        int64_t last_end = INT64_MIN;
+        int complete = c->frag_index.complete;
+        for (int i = 0; i < c->frag_index.nb_items; i++) {
+            MOVFragmentStreamInfo *si = get_frag_stream_info(&c->frag_index, i, sc->id);
+            if (!si || si->sidx_pts == AV_NOPTS_VALUE || si->sidx_duration <= 0) {
+                complete = 0;
+                break;
+            }
+            int64_t pts = av_sat_sub64(si->sidx_pts, sc->time_offset);
+            int64_t start = av_rescale_q(pts, st->time_base, AV_TIME_BASE_Q);
+            int64_t end = av_rescale_q(av_sat_add64(pts, si->sidx_duration),
+                                       st->time_base, AV_TIME_BASE_Q);
+            if (start < last_end || end <= start) {
+                complete = 0;
+                break;
+            }
+            av_bprintf(&text, "%s[%"PRId64",%"PRId64"]", count ? "," : "", start, end);
+            last_end = end;
+            count++;
+        }
+        av_bprintf(&text, "],\"complete\":%s}", complete ? "true" : "false");
+        if (count && av_bprint_is_complete(&text)) {
+            const AVDictionaryEntry *old = av_dict_get(st->metadata, "fragment-index", NULL, 0);
+            if ((!old || strcmp(old->value, text.str)) &&
+                av_dict_set(&st->metadata, "fragment-index", text.str, 0) >= 0)
+                st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+        } else if (av_dict_get(st->metadata, "fragment-index", NULL, 0)) {
+            av_dict_set(&st->metadata, "fragment-index", NULL, 0);
+            st->event_flags |= AVSTREAM_EVENT_FLAG_METADATA_UPDATED;
+        }
+        av_bprint_finalize(&text, NULL);
+    }
+}
+
 static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     int64_t stream_size = avio_size(pb);
@@ -6607,8 +6653,10 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
         index = update_frag_index(c, offset);
         frag_stream_info = get_frag_stream_info(&c->frag_index, index, track_id);
-        if (frag_stream_info)
+        if (frag_stream_info) {
             frag_stream_info->sidx_pts = timestamp;
+            frag_stream_info->sidx_duration = av_rescale_q(duration, timescale, st->time_base);
+        }
 
         if (av_sat_add64(offset, size) != offset + (uint64_t)size ||
             av_sat_add64(pts, duration) != pts + (uint64_t)duration
@@ -6666,6 +6714,7 @@ static int mov_read_sidx(MOVContext *c, AVIOContext *pb, MOVAtom atom)
             c->frag_index.complete = 1;
     }
 
+    mov_export_fragment_index(c);
     return 0;
 }
 

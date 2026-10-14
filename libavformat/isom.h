@@ -145,6 +145,7 @@ typedef struct MOVEncryptionIndex {
 typedef struct MOVFragmentStreamInfo {
     int id;
     int64_t sidx_pts;
+    int64_t sidx_duration;
     int64_t first_tfra_pts;
     int64_t tfdt_dts;
     int64_t next_trun_dts;
